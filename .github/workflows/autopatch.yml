@@ -2,8 +2,8 @@ name: Auto Patch Instafel (Local Mode)
 
 on:
   schedule:
-    # 毎日 日本時間 午前4時 (UTC 19:00) にチェック
-    - cron: '0 19 * * *'
+    # 毎日 日本時間 午前4時 / 午後4時 (UTC 19:00 / 07:00) にチェック
+    - cron: '0 7,19 * * *'
   workflow_dispatch: # 手動実行用
 
 permissions:
@@ -34,63 +34,123 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager "build-tools;34.0.0" "platform-tools"
 
-      # 4. 更新チェック
+      # 4. 更新チェック (Instafel公式API経由)
+      #    upstreamの GitHub Releases からAPK配布が撤去されたため、
+      #    公式サイト https://instafel.mamii.dev が使っている公開JSON APIを叩く。
       - name: Check for updates
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_REPO: "mamiiblt/instafel"
+          API_BASE: "https://api.mamii.dev"
+          CDN_BASE: "https://cdn.mamii.dev/instafel/releases"
         run: |
-          # 最新のInstafelのタグを取得
-          LATEST_TAG=$(gh release list --repo "$UPSTREAM_REPO" --limit 1 --json tagName --jq '.[0].tagName')
-          echo "Upstream version: $LATEST_TAG"
+          set -euo pipefail
 
-          # 自分のリポジトリの最新リリースを取得
-          CURRENT_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || echo "")
-          echo "Current local version: $CURRENT_TAG"
+          # --- リリース一覧を取得 ---
+          # releases[] は新しい順の配列で、要素は
+          # [iflVersion, iflGenID, igVersion, releaseDate, isDeleted, changelogs, patcherVersion]
+          echo "Fetching release list from $API_BASE ..."
+          LIST=$(curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+            "$API_BASE/content/rels/list?page=1")
 
-          if [ -z "$LATEST_TAG" ]; then
-            echo "Error: Could not find upstream release."
+          # 削除済み (isDeleted == true) はCDNから実ファイルが消えているので除外し、
+          # 生き残っている中で最新のものを選ぶ
+          LATEST=$(echo "$LIST" | jq -c '[.releases[] | select(.[4] == false)][0]')
+
+          if [ -z "$LATEST" ] || [ "$LATEST" == "null" ]; then
+            echo "Error: No available (non-deleted) release found in API response."
             exit 1
           fi
 
-          if [ "$LATEST_TAG" == "$CURRENT_TAG" ]; then
+          IFL_VER=$(echo "$LATEST" | jq -r '.[0]')
+          IG_VER=$(echo "$LATEST" | jq -r '.[2]')
+          PATCHER_VER=$(echo "$LATEST" | jq -r '.[6]')
+          TAG_NAME="v${IFL_VER}"
+
+          echo "Upstream version: $TAG_NAME (Instagram $IG_VER, patcher $PATCHER_VER)"
+
+          # --- 自分のリポジトリの最新リリースを取得 ---
+          CURRENT_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          echo "Current local version: ${CURRENT_TAG:-(none)}"
+
+          # タグ 'vNNN' から数値部分だけ取り出す (取れなければ 0 扱い)
+          CURRENT_NUM=$(echo "${CURRENT_TAG#v}" | grep -oE '^[0-9]+' || echo "0")
+          CURRENT_NUM=${CURRENT_NUM:-0}
+
+          if [ "$IFL_VER" -le "$CURRENT_NUM" ]; then
             echo "Already up to date."
             echo "update_needed=false" >> $GITHUB_OUTPUT
-          else
-            echo "New version found!"
-            echo "update_needed=true" >> $GITHUB_OUTPUT
-            echo "tag_name=$LATEST_TAG" >> $GITHUB_OUTPUT
-            echo "upstream_repo=$UPSTREAM_REPO" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      # 5. Instafel APKのダウンロード
+          # 念のためタグの実在チェック。
+          # (リリースを消した直後などに gh release create がタグ重複で落ちるのを防ぐ)
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists. Skipping."
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # --- リリース詳細からファイル名とハッシュを取得 ---
+          echo "Fetching release details for $TAG_NAME ..."
+          DETAIL=$(curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+            "$API_BASE/content/rels/get/${IFL_VER}")
+
+          # Clone版 ('instafel_c_') を使う。非Clone版は fileInfos.unclone。
+          FILE_NAME=$(echo "$DETAIL" | jq -r '.fileInfos.clone.fileName // empty')
+          FILE_HASH=$(echo "$DETAIL" | jq -r '.fileInfos.clone.fileHash // empty')
+
+          if [ -z "$FILE_NAME" ] || [ -z "$FILE_HASH" ]; then
+            echo "Error: Clone build info not found for $TAG_NAME."
+            echo "$DETAIL"
+            exit 1
+          fi
+
+          DOWNLOAD_URL="${CDN_BASE}/v${IFL_VER}/${FILE_NAME}"
+
+          echo "New version found!"
+          echo "  file: $FILE_NAME"
+          echo "  md5 : $FILE_HASH"
+          echo "  url : $DOWNLOAD_URL"
+
+          {
+            echo "update_needed=true"
+            echo "tag_name=$TAG_NAME"
+            echo "ifl_version=$IFL_VER"
+            echo "ig_version=$IG_VER"
+            echo "patcher_version=$PATCHER_VER"
+            echo "file_name=$FILE_NAME"
+            echo "file_hash=$FILE_HASH"
+            echo "download_url=$DOWNLOAD_URL"
+          } >> $GITHUB_OUTPUT
+
+      # 5. Instafel APKのダウンロード (公式CDNから)
       - name: Download Instafel APK
         if: steps.check.outputs.update_needed == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_REPO: ${{ steps.check.outputs.upstream_repo }}
-          TAG_NAME: ${{ steps.check.outputs.tag_name }}
+          DOWNLOAD_URL: ${{ steps.check.outputs.download_url }}
+          FILE_NAME: ${{ steps.check.outputs.file_name }}
+          FILE_HASH: ${{ steps.check.outputs.file_hash }}
         run: |
-          echo "Fetching asset list for $TAG_NAME..."
+          set -euo pipefail
 
-          ASSET_LIST=$(gh release view "$TAG_NAME" --repo "$UPSTREAM_REPO" --json assets --jq '.assets[].name | select(endswith(".apk"))')
-          echo "Found assets:"
-          echo "$ASSET_LIST"
+          echo "Downloading $FILE_NAME ..."
+          curl -fL -sS --retry 5 --retry-delay 10 --retry-all-errors \
+            -o instafel.apk "$DOWNLOAD_URL"
 
-          # Clone版 ('instafel_c_') を検索して抽出
-          TARGET_FILE=$(echo "$ASSET_LIST" | grep "instafel_c_" | head -n 1)
+          ls -lh instafel.apk
 
-          if [ -z "$TARGET_FILE" ]; then
-            echo "Warning: Clone version (instafel_c_) not explicitly found."
-            echo "Falling back to the first available apk."
-            TARGET_FILE=$(echo "$ASSET_LIST" | head -n 1)
+          # APIが返すMD5と照合する
+          ACTUAL_HASH=$(md5sum instafel.apk | cut -d' ' -f1)
+          echo "expected md5: $FILE_HASH"
+          echo "actual   md5: $ACTUAL_HASH"
+
+          if [ "$ACTUAL_HASH" != "$FILE_HASH" ]; then
+            echo "Error: MD5 mismatch. Aborting."
+            exit 1
           fi
 
-          echo "Selected target file: $TARGET_FILE"
-
-          gh release download "$TAG_NAME" --repo "$UPSTREAM_REPO" --pattern "$TARGET_FILE" --output "instafel.apk" --clobber
-          ls -lh instafel.apk
+          echo "MD5 verified."
 
       # 6. LSPatch (JingMatrix版) のダウンロード
       - name: Download LSPatch (JingMatrix)
@@ -192,8 +252,13 @@ jobs:
         if: steps.check.outputs.update_needed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.check.outputs.tag_name }}
+          IG_VERSION: ${{ steps.check.outputs.ig_version }}
+          PATCHER_VERSION: ${{ steps.check.outputs.patcher_version }}
         run: |
-          gh release create "${{ steps.check.outputs.tag_name }}" \
+          set -euo pipefail
+
+          gh release create "$TAG_NAME" \
             output/instafel-patched.apk \
-            --title "Instafel Patched ${{ steps.check.outputs.tag_name }}" \
-            --notes "Base: Instafel Clone (c) ${{ steps.check.outputs.tag_name }}<br>LSPatch: JingMatrix (Local Mode + Inject Dex)"
+            --title "Instafel Patched $TAG_NAME" \
+            --notes "Base: Instafel Clone (c) $TAG_NAME (Instagram $IG_VERSION)<br>Source: https://instafel.mamii.dev<br>Patcher: $PATCHER_VERSION<br>LSPatch: JingMatrix (Local Mode + Inject Dex)"
