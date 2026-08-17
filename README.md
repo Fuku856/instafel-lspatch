@@ -5,7 +5,7 @@ GitHub Actionsのワークフローにより自動的にビルドされます。
 
 ## Base APKの入手元
 GitHubのリリースからInstafelのAPK配布が無くなったため、公式サイトから取得するようにしました。 <br>
-https://instafel.mamii.dev/releases/list <br>
+https://instafel.mamii.dev/releases/list?page=1 <br>
 Workflowが公式APIを直接叩いて最新版を検出し、Clone版 (`instafel_c_`) をCDNからダウンロードして、MD5を照合してからパッチを当てます。 <br>
 1日2回 (日本時間 午前4時 / 午後4時) にチェックされます。 <br>
 
