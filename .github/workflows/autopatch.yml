@@ -26,8 +26,14 @@ jobs:
           java-version: '21'
 
       # 3. Android SDKのセットアップ
+      #    packages を明示指定する。デフォルトの 'tools platform-tools' は
+      #    廃止済みの 'tools' パッケージを含んでおり、Googleのリポジトリから
+      #    削除されたため sdkmanager が
+      #    "Failed to find package 'tools'" で失敗するようになった。
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android Build Tools
         run: |
