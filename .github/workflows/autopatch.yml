@@ -159,70 +159,62 @@ jobs:
           echo "MD5 verified."
 
       # 6. LSPatch (JingMatrix版) のダウンロード
+      #    - canary (pre-release) は CI でしかテストされていないので使わない。
+      #      'gh release list --limit 1' は pre-release も含めて作成日順に返すため、
+      #      'gh release view' (= Latest の安定版) でタグを取る。
+      #    - リリースには *-debug.jar と *-release.jar が両方あり、名前順だと
+      #      debug が先に来るので、必ず release ビルドの jar を選ぶ。
       - name: Download LSPatch (JingMatrix)
+        id: lspatch
         if: steps.check.outputs.update_needed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LSPATCH_REPO: "JingMatrix/LSPatch"
         run: |
-          echo "Downloading latest LSPatch resources from $LSPATCH_REPO..."
-          LATEST_LSPATCH_TAG=$(gh release list --repo "$LSPATCH_REPO" --limit 1 --json tagName --jq '.[0].tagName')
+          set -euo pipefail
 
-          if [ -z "$LATEST_LSPATCH_TAG" ]; then
+          echo "Downloading latest stable LSPatch from $LSPATCH_REPO..."
+          LSPATCH_TAG=$(gh release view --repo "$LSPATCH_REPO" --json tagName --jq '.tagName')
+
+          if [ -z "$LSPATCH_TAG" ]; then
             echo "Error: Could not find LSPatch release."
             exit 1
           fi
 
-          echo "LSPatch version: $LATEST_LSPATCH_TAG"
+          echo "LSPatch version: $LSPATCH_TAG"
 
-          # --- .jar ダウンロード ---
-          # 複数ヒットに備えて1ファイルだけ選択してダウンロード
-          JAR_FILE=$(gh release view "$LATEST_LSPATCH_TAG" --repo "$LSPATCH_REPO" --json assets \
-            --jq '.assets[].name | select(endswith(".jar"))' | head -n 1)
+          JAR_FILE=$(gh release view "$LSPATCH_TAG" --repo "$LSPATCH_REPO" --json assets \
+            --jq '.assets[].name | select(endswith("-release.jar"))' | head -n 1)
 
           if [ -z "$JAR_FILE" ]; then
-            echo "Error: No .jar asset found in LSPatch release."
+            echo "Error: No release .jar asset found in LSPatch $LSPATCH_TAG."
             exit 1
           fi
 
           echo "Selected jar: $JAR_FILE"
-          gh release download "$LATEST_LSPATCH_TAG" --repo "$LSPATCH_REPO" --pattern "$JAR_FILE" --output "lspatch.jar" --clobber
+          gh release download "$LSPATCH_TAG" --repo "$LSPATCH_REPO" --pattern "$JAR_FILE" --output "lspatch.jar" --clobber
 
-          # --- Manager APK ダウンロード ---
-          # .apk が複数ある場合に備え、"manager" を含むファイルを優先して1つだけ選択
-          APK_LIST=$(gh release view "$LATEST_LSPATCH_TAG" --repo "$LSPATCH_REPO" --json assets \
-            --jq '.assets[].name | select(endswith(".apk"))')
+          ls -lh lspatch.jar
 
-          MANAGER_FILE=$(echo "$APK_LIST" | grep -i "manager" | head -n 1)
+          {
+            echo "tag=$LSPATCH_TAG"
+            echo "jar=$JAR_FILE"
+          } >> $GITHUB_OUTPUT
 
-          if [ -z "$MANAGER_FILE" ]; then
-            echo "Warning: 'manager' apk not found by name, falling back to first .apk"
-            MANAGER_FILE=$(echo "$APK_LIST" | head -n 1)
-          fi
-
-          if [ -z "$MANAGER_FILE" ]; then
-            echo "Error: No .apk asset found in LSPatch release."
-            exit 1
-          fi
-
-          echo "Selected manager apk: $MANAGER_FILE"
-          gh release download "$LATEST_LSPATCH_TAG" --repo "$LSPATCH_REPO" --pattern "$MANAGER_FILE" --output "manager.apk" --clobber
-
-          ls -lh lspatch.jar manager.apk
-
-      # 7. パッチ適用 (Local Mode + 注入ローダーデックス)
-      - name: Apply LSPatch (Local Mode)
+      # 7. パッチ適用 (Manager Mode + 注入ローダーデックス)
+      #    '--manager' は値を取らないフラグ。以前は '--manager manager.apk' と
+      #    渡していたため manager.apk が「パッチ対象のAPK」として扱われていた。
+      - name: Apply LSPatch (Manager Mode)
         if: steps.check.outputs.update_needed == 'true'
         run: |
           mkdir -p output
 
-          echo "Applying patch in Local Mode with Inject Loader Dex..."
-          java -jar lspatch.jar instafel.apk --manager manager.apk --injectdex -f -o output
+          echo "Applying patch in Manager Mode with Inject Loader Dex..."
+          java -jar lspatch.jar --manager --injectdex -f -o output instafel.apk
 
           echo "Files in output directory:"
           ls -lh output/
 
-          # Instafelのパッチ済みファイルのみを特定してリネーム
           mv output/instafel-*-lspatched.apk output/instafel-patched-unsigned.apk
 
       # 8. 署名 (apksignerを直接使用)
@@ -261,10 +253,12 @@ jobs:
           TAG_NAME: ${{ steps.check.outputs.tag_name }}
           IG_VERSION: ${{ steps.check.outputs.ig_version }}
           PATCHER_VERSION: ${{ steps.check.outputs.patcher_version }}
+          LSPATCH_TAG: ${{ steps.lspatch.outputs.tag }}
+          LSPATCH_JAR: ${{ steps.lspatch.outputs.jar }}
         run: |
           set -euo pipefail
 
           gh release create "$TAG_NAME" \
             output/instafel-patched.apk \
             --title "Instafel Patched $TAG_NAME" \
-            --notes "Base: Instafel Clone (c) $TAG_NAME (Instagram $IG_VERSION)<br>Source: https://instafel.mamii.dev<br>Patcher: $PATCHER_VERSION<br>LSPatch: JingMatrix (Local Mode + Inject Dex)"
+            --notes "Base: Instafel Clone (c) $TAG_NAME (Instagram $IG_VERSION)<br>Source: https://instafel.mamii.dev<br>Patcher: $PATCHER_VERSION<br>LSPatch: JingMatrix $LSPATCH_TAG ($LSPATCH_JAR, Manager Mode + Inject Dex)"
